@@ -118,18 +118,10 @@ class QueuePollTask(BaseTask):
     def retrieve_events(self, max_events=1):
         """Attempts to retrieve events from the provided SQS queue"""
         session = bc_session.get_session()
-        sqs = session.get_service("sqs")
-        receive = sqs.get_operation("ReceiveMessage")
-        http_response, response_data = receive.call(sqs.get_endpoint(self._region),
-                                                    queue_url=self._queue_url,
-                                                    wait_time_seconds=20,
-                                                    max_number_of_messages=max_events)
-
-        # Swallow up any errors/issues, logging them out
-        if http_response.status_code != 200 or not "Messages" in response_data:
-            log.error(u"Failed to retrieve messages from queue %s with status_code %s: %s" %
-                      (self._queue_url, http_response.status_code, response_data))
-            return []
+        sqs = session.create_client("sqs", region_name=self._region)
+        response_data = sqs.receive_message(QueueUrl=self._queue_url,
+                                            WaitTimeSeconds=20,
+                                            MaxNumberOfMessages=max_events)
 
         events = []
         for msg in response_data.get("Messages", []):

@@ -17,22 +17,87 @@ import logging
 import time
 import threading
 
-from .vendored.requests.sessions import Session
-from .vendored.requests.utils import get_environ_proxies
-import six
+from botocore.vendored.requests.adapters import HTTPAdapter
+from botocore.vendored.requests.sessions import Session
+from botocore.vendored.requests.utils import get_environ_proxies
+from botocore.vendored.requests.exceptions import ConnectionError
+from botocore.vendored import six
 
-from . import response as bc_response
-from . import exceptions as bc_exceptions
-from .auth import AUTH_TYPE_MAPS
-from .exceptions import UnknownSignatureVersionError, UnknownEndpointError
-from .awsrequest import AWSRequest
-from .compat import urljoin, json, quote
-from .utils import percent_encode_sequence
-from .hooks import first_non_none_response
+from botocore.awsrequest import create_request_object
+from botocore.exceptions import UnknownEndpointError
+from botocore.exceptions import EndpointConnectionError
+from botocore.exceptions import ConnectionClosedError
+from botocore.compat import filter_ssl_warnings
+from botocore.utils import is_valid_endpoint_url
+from botocore.hooks import first_non_none_response
+from botocore.response import StreamingBody
+from botocore import parsers
 
 
 logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = 60
+MAX_POOL_CONNECTIONS = 10
+filter_ssl_warnings()
+
+try:
+    from botocore.vendored.requests.packages.urllib3.contrib import pyopenssl
+    pyopenssl.extract_from_urllib3()
+except ImportError:
+    pass
+
+
+def convert_to_response_dict(http_response, operation_model):
+    """Convert an HTTP response object to a request dict.
+
+    This converts the requests library's HTTP response object to
+    a dictionary.
+
+    :type http_response: botocore.vendored.requests.model.Response
+    :param http_response: The HTTP response from an AWS service request.
+
+    :rtype: dict
+    :return: A response dictionary which will contain the following keys:
+        * headers (dict)
+        * status_code (int)
+        * body (string or file-like object)
+
+    """
+    response_dict = {
+        'headers': http_response.headers,
+        'status_code': http_response.status_code,
+    }
+    if response_dict['status_code'] >= 300:
+        response_dict['body'] = http_response.content
+    elif operation_model.has_streaming_output:
+        response_dict['body'] = StreamingBody(
+            http_response.raw, response_dict['headers'].get('content-length'))
+    else:
+        response_dict['body'] = http_response.content
+    return response_dict
+
+
+class BotocoreHTTPSession(Session):
+    """Internal session class used to workaround requests behavior.
+
+    This class is intended to be used only by the Endpoint class.
+
+    """
+    def __init__(self, max_pool_connections=MAX_POOL_CONNECTIONS,
+                 http_adapter_cls=HTTPAdapter):
+        super(BotocoreHTTPSession, self).__init__()
+        # In order to support a user provided "max_pool_connections", we need
+        # to recreate the HTTPAdapter and pass in our max_pool_connections
+        # value.
+        adapter = http_adapter_cls(pool_maxsize=max_pool_connections)
+        # requests uses an HTTPAdapter for mounting both http:// and https://
+        self.mount('https://', adapter)
+        self.mount('http://', adapter)
+
+    def rebuild_auth(self, prepared_request, response):
+        # Keep the existing auth information from the original prepared request.
+        # Normally this method would be where auth is regenerated as needed.
+        # By making this a noop, we're keeping the existing auth info.
+        pass
 
 
 class Endpoint(object):
@@ -46,23 +111,26 @@ class Endpoint(object):
     :ivar session: The session object.
     """
 
-    def __init__(self, region_name, host, auth, user_agent, signature_version,
-                 endpoint_prefix, event_emitter, proxies=None, verify=True,
-                 timeout=DEFAULT_TIMEOUT):
+    def __init__(self, host, endpoint_prefix,
+                 event_emitter, proxies=None, verify=True,
+                 timeout=DEFAULT_TIMEOUT, response_parser_factory=None,
+                 max_pool_connections=MAX_POOL_CONNECTIONS):
         self._endpoint_prefix = endpoint_prefix
-        self._signature_version = signature_version
         self._event_emitter = event_emitter
-        self._user_agent = user_agent
-        self.region_name = region_name
         self.host = host
         self.verify = verify
-        self.auth = auth
         if proxies is None:
             proxies = {}
         self.proxies = proxies
-        self.http_session = Session()
+        self.http_session = BotocoreHTTPSession(
+            max_pool_connections=max_pool_connections)
         self.timeout = timeout
+        self.max_pool_connections = max_pool_connections
+        logger.debug('Setting %s timeout as %s', endpoint_prefix, self.timeout)
         self._lock = threading.Lock()
+        if response_parser_factory is None:
+            response_parser_factory = parsers.ResponseParserFactory()
+        self._response_parser_factory = response_parser_factory
 
     def __repr__(self):
         return '%s(%s)' % (self._endpoint_prefix, self.host)
@@ -70,105 +138,115 @@ class Endpoint(object):
     def make_request(self, operation_model, request_dict):
         logger.debug("Making request for %s (verify_ssl=%s) with params: %s",
                      operation_model, self.verify, request_dict)
-        prepared_request = self.create_request(request_dict)
-        return self._send_request(prepared_request, operation_model)
+        return self._send_request(request_dict, operation_model)
 
-    def _choose_signer(self, signer=None):
-        # To decide if we need to do auth or not we check the
-        # signature_version attribute on both the service and
-        # the operation are not None and we make sure there is an
-        # auth class associated with the endpoint.
-        # If any of these are not true, we skip auth.
-        if signer is not None:
-            # If the user explicitly specifies a signer, then we will sign
-            # the request.
-            signer = signer
-        else:
-            do_auth = self._signature_version and self.auth
-            if do_auth:
-                signer = self.auth
-            else:
-                # If we're not suppose to sign the request, then we set the
-                # signer to None.
-                signer = None
-        return signer
-
-    def create_request(self, params, signer=None):
-        signer = self._choose_signer(signer)
-        request = self._create_request_object(params)
-        prepared_request = self.prepare_request(request, signer)
+    def create_request(self, params, operation_model=None):
+        request = create_request_object(params)
+        if operation_model:
+            event_name = 'request-created.{endpoint_prefix}.{op_name}'.format(
+                endpoint_prefix=self._endpoint_prefix,
+                op_name=operation_model.name)
+            self._event_emitter.emit(event_name, request=request,
+                                     operation_name=operation_model.name)
+        prepared_request = self.prepare_request(request)
         return prepared_request
 
-    def _create_request_object(self, request_dict):
-        r = request_dict
-        user_agent = self._user_agent
-        headers = r['headers']
-        headers['User-Agent'] = user_agent
-        url = urljoin(self.host, r['url_path'])
-        if r['query_string']:
-            encoded_query_string = percent_encode_sequence(r['query_string'])
-            if '?' not in url:
-                url += '?%s' % encoded_query_string
-            else:
-                url += '&%s' % encoded_query_string
-        request = AWSRequest(method=r['method'], url=url,
-                             data=r['body'],
-                             headers=headers)
-        return request
+    def _encode_headers(self, headers):
+        # In place encoding of headers to utf-8 if they are unicode.
+        for key, value in headers.items():
+            if isinstance(value, six.text_type):
+                headers[key] = value.encode('utf-8')
 
-    def prepare_request(self, request, signer):
-        if signer is not None:
-            with self._lock:
-                # Parts of the auth signing code aren't thread safe (things
-                # that manipulate .auth_path), so we're using a lock here to
-                # prevent race conditions.
-                event_name = 'before-auth.%s' % self._endpoint_prefix
-                self._event_emitter.emit(
-                    event_name, endpoint=self, request=request, auth=signer)
-                signer.add_auth(request=request)
-        prepared_request = request.prepare()
-        return prepared_request
+    def prepare_request(self, request):
+        self._encode_headers(request.headers)
+        return request.prepare()
 
-    def _send_request(self, request, operation_model):
+    def _send_request(self, request_dict, operation_model):
         attempts = 1
-        response, exception = self._get_response(request, operation_model, attempts)
-        while self._needs_retry(attempts, operation_model, response, exception):
+        request = self.create_request(request_dict, operation_model)
+        success_response, exception = self._get_response(
+            request, operation_model, attempts)
+        while self._needs_retry(attempts, operation_model, request_dict,
+                                success_response, exception):
             attempts += 1
             # If there is a stream associated with the request, we need
             # to reset it before attempting to send the request again.
             # This will ensure that we resend the entire contents of the
             # body.
             request.reset_stream()
-            # Resign the request when retried.
-            signer = self._choose_signer()
-            request = self.prepare_request(request.original, signer)
-            response, exception = self._get_response(request, operation_model,
-                                                     attempts)
-        return response
+            # Create a new request when retried (including a new signature).
+            request = self.create_request(
+                request_dict, operation_model)
+            success_response, exception = self._get_response(
+                request, operation_model, attempts)
+        if success_response is not None and \
+                'ResponseMetadata' in success_response[1]:
+            # We want to share num retries, not num attempts.
+            total_retries = attempts - 1
+            success_response[1]['ResponseMetadata']['RetryAttempts'] = \
+                    total_retries
+        if exception is not None:
+            raise exception
+        else:
+            return success_response
 
     def _get_response(self, request, operation_model, attempts):
+        # This will return a tuple of (success_response, exception)
+        # and success_response is itself a tuple of
+        # (http_response, parsed_dict).
+        # If an exception occurs then the success_response is None.
+        # If no exception occurs then exception is None.
         try:
             logger.debug("Sending http request: %s", request)
             http_response = self.http_session.send(
                 request, verify=self.verify,
                 stream=operation_model.has_streaming_output,
                 proxies=self.proxies, timeout=self.timeout)
+        except ConnectionError as e:
+            # For a connection error, if it looks like it's a DNS
+            # lookup issue, 99% of the time this is due to a misconfigured
+            # region/endpoint so we'll raise a more specific error message
+            # to help users.
+            logger.debug("ConnectionError received when sending HTTP request.",
+                         exc_info=True)
+            if self._looks_like_dns_error(e):
+                endpoint_url = e.request.url
+                better_exception = EndpointConnectionError(
+                    endpoint_url=endpoint_url, error=e)
+                return (None, better_exception)
+            elif self._looks_like_bad_status_line(e):
+                better_exception = ConnectionClosedError(
+                    endpoint_url=e.request.url, request=e.request)
+                return (None, better_exception)
+            else:
+                return (None, e)
         except Exception as e:
             logger.debug("Exception received when sending HTTP request.",
                          exc_info=True)
             return (None, e)
         # This returns the http_response and the parsed_data.
-        return (bc_response.get_response(operation_model,
-                                               http_response), None)
+        response_dict = convert_to_response_dict(http_response,
+                                                 operation_model)
+        parser = self._response_parser_factory.create_parser(
+            operation_model.metadata['protocol'])
+        parsed_response = parser.parse(
+            response_dict, operation_model.output_shape)
+        return (http_response, parsed_response), None
 
-    def _needs_retry(self, attempts, operation_model, response=None,
-                     caught_exception=None):
+    def _looks_like_dns_error(self, e):
+        return 'gaierror' in str(e) and e.request is not None
+
+    def _looks_like_bad_status_line(self, e):
+        return 'BadStatusLine' in str(e) and e.request is not None
+
+    def _needs_retry(self, attempts, operation_model, request_dict,
+                     response=None, caught_exception=None):
         event_name = 'needs-retry.%s.%s' % (self._endpoint_prefix,
                                             operation_model.name)
         responses = self._event_emitter.emit(
             event_name, response=response, endpoint=self,
             operation=operation_model, attempts=attempts,
-            caught_exception=caught_exception)
+            caught_exception=caught_exception, request_dict=request_dict)
         handler_response = first_non_none_response(responses)
         if handler_response is None:
             return False
@@ -181,139 +259,44 @@ class Endpoint(object):
             return True
 
 
-def _get_proxies(url):
-    # We could also support getting proxies from a config file,
-    # but for now proxy support is taken from the environment.
-    return get_environ_proxies(url)
-
-
-def get_endpoint(service, region_name, endpoint_url, verify=None):
-    service_name = getattr(service, 'signing_name', service.endpoint_prefix)
-    endpoint_prefix = service.endpoint_prefix
-    signature_version = getattr(service, 'signature_version', None)
-    session = service.session
-    credentials = session.get_credentials()
-    event_emitter = session.get_component('event_emitter')
-    user_agent = session.user_agent()
-    auth = None
-    return get_endpoint_complex(service_name, endpoint_prefix,
-                                signature_version, credentials,
-                                region_name, endpoint_url, verify, user_agent,
-                                event_emitter)
-
-
-def get_endpoint_complex(service_name, endpoint_prefix, signature_version,
-                         credentials, region_name, endpoint_url, verify,
-                         user_agent, event_emitter):
-    auth = None
-    if signature_version is not None:
-        auth = _get_auth(signature_version,
-                         credentials=credentials,
-                         service_name=service_name,
-                         region_name=region_name)
-    proxies = _get_proxies(endpoint_url)
-    verify = _get_verify_value(verify)
-    return Endpoint(region_name, endpoint_url, auth=auth,
-               user_agent=user_agent,
-               endpoint_prefix=endpoint_prefix,
-               event_emitter=event_emitter,
-               signature_version=signature_version,
-               proxies=proxies,
-               verify=verify)
-
-
-def _get_verify_value(verify):
-    # This is to account for:
-    # https://github.com/kennethreitz/requests/issues/1436
-    # where we need to honor REQUESTS_CA_BUNDLE because we're creating our
-    # own request objects.
-    # First, if verify is not None, then the user explicitly specified
-    # a value so this automatically wins.
-    if verify is not None:
-        return verify
-    # Otherwise use the value from REQUESTS_CA_BUNDLE, or default to
-    # True if the env var does not exist.
-    return os.environ.get('REQUESTS_CA_BUNDLE', True)
-
-
-def _get_auth(signature_version, credentials, service_name, region_name):
-    cls = AUTH_TYPE_MAPS.get(signature_version)
-    if cls is None:
-        raise UnknownSignatureVersionError(signature_version=signature_version)
-    else:
-        kwargs = {'credentials': credentials}
-        if cls.REQUIRES_REGION:
-            if region_name is None:
-                raise bc_exceptions.NoRegionError(
-                    env_var='AWS_DEFAULT_REGION')
-            kwargs['region_name'] = region_name
-            kwargs['service_name'] = service_name
-        return cls(**kwargs)
-
-
 class EndpointCreator(object):
-    def __init__(self, endpoint_resolver, configured_region, event_emitter,
-                 credentials, user_agent):
-        self._endpoint_resolver = endpoint_resolver
-        self._configured_region = configured_region
+    def __init__(self, event_emitter):
         self._event_emitter = event_emitter
-        self._credentials = credentials
-        self._user_agent = user_agent
 
-    def create_endpoint(self, service_model, region_name=None, is_secure=True,
-                        endpoint_url=None, verify=None, credentials=None):
-        if region_name is None:
-            region_name = self._configured_region
-        # Use the endpoint resolver heuristics to build the endpoint url.
-        scheme = 'https' if is_secure else 'http'
-        try:
-            endpoint = self._endpoint_resolver.construct_endpoint(
-                service_model.endpoint_prefix,
-                region_name, scheme=scheme)
-        except UnknownEndpointError:
-            if endpoint_url is not None:
-                # If the user provides an endpoint_url, it's ok
-                # if the heuristics didn't find anything.  We use the
-                # user provided endpoint_url.
-                endpoint = {'uri': endpoint_url, 'properties': {}}
-            else:
-                raise
-        # We only support the credentialScope.region in the properties
-        # bag right now, so if it's available, it will override the
-        # provided region name.
-        region_name_override = endpoint['properties'].get(
-            'credentialScope', {}).get('region')
-        signature_version = service_model.signature_version
-        if 'signatureVersion' in endpoint['properties']:
-            signature_version = endpoint['properties']['signatureVersion']
-        if region_name_override is not None:
-            # Letting the heuristics rule override the region_name
-            # allows for having a default region of something like us-west-2
-            # for IAM, but we still will know to use us-east-1 for sigv4.
-            region_name = region_name_override
-        if endpoint_url is not None:
-            # If the user provides an endpoint url, we'll use that
-            # instead of what the heuristics rule gives us.
-            final_endpoint_url = endpoint_url
-        else:
-            final_endpoint_url = endpoint['uri']
-        return self._get_endpoint(service_model, region_name,
-                                  signature_version, final_endpoint_url,
-                                  verify, credentials)
+    def create_endpoint(self, service_model, region_name, endpoint_url,
+                        verify=None, response_parser_factory=None,
+                        timeout=DEFAULT_TIMEOUT,
+                        max_pool_connections=MAX_POOL_CONNECTIONS,
+                        proxies=None):
+        if not is_valid_endpoint_url(endpoint_url):
 
-    def _get_endpoint(self, service_model, region_name, signature_version,
-                      endpoint_url, verify, user_provided_creds):
-        service_name = service_model.signing_name
-        endpoint_prefix = service_model.endpoint_prefix
-        credentials = self._credentials
-        if user_provided_creds is not None:
-            # Credentials provided via create_endpoint() override the
-            # credentials provided when the EndpointCreator was created.
-            credentials = user_provided_creds
-        user_agent = self._user_agent
-        event_emitter = self._event_emitter
-        user_agent = self._user_agent
-        return get_endpoint_complex(service_name, endpoint_prefix,
-                                    signature_version, credentials,
-                                    region_name, endpoint_url,
-                                    verify, user_agent, event_emitter)
+            raise ValueError("Invalid endpoint: %s" % endpoint_url)
+        if proxies is None:
+            proxies = self._get_proxies(endpoint_url)
+        return Endpoint(
+            endpoint_url,
+            endpoint_prefix=service_model.endpoint_prefix,
+            event_emitter=self._event_emitter,
+            proxies=proxies,
+            verify=self._get_verify_value(verify),
+            timeout=timeout,
+            max_pool_connections=max_pool_connections,
+            response_parser_factory=response_parser_factory)
+
+    def _get_proxies(self, url):
+        # We could also support getting proxies from a config file,
+        # but for now proxy support is taken from the environment.
+        return get_environ_proxies(url)
+
+    def _get_verify_value(self, verify):
+        # This is to account for:
+        # https://github.com/kennethreitz/requests/issues/1436
+        # where we need to honor REQUESTS_CA_BUNDLE because we're creating our
+        # own request objects.
+        # First, if verify is not None, then the user explicitly specified
+        # a value so this automatically wins.
+        if verify is not None:
+            return verify
+        # Otherwise use the value from REQUESTS_CA_BUNDLE, or default to
+        # True if the env var does not exist.
+        return os.environ.get('REQUESTS_CA_BUNDLE', True)

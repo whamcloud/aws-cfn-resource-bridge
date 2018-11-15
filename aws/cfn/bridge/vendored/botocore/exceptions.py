@@ -11,6 +11,8 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
+from __future__ import unicode_literals
+from botocore.vendored.requests.exceptions import ConnectionError
 
 
 class BotoCoreError(Exception):
@@ -19,7 +21,7 @@ class BotoCoreError(Exception):
 
     :ivar msg: The descriptive message associated with the error.
     """
-    fmt = 'An unspecified error occured'
+    fmt = 'An unspecified error occurred'
 
     def __init__(self, **kwargs):
         msg = self.fmt.format(**kwargs)
@@ -36,6 +38,17 @@ class DataNotFoundError(BotoCoreError):
     fmt = 'Unable to load data for: {data_path}'
 
 
+class UnknownServiceError(DataNotFoundError):
+    """Raised when trying to load data for an unknown service.
+
+    :ivar service_name: The name of the unknown service.
+
+    """
+    fmt = (
+        "Unknown service: '{service_name}'. Valid service names are: "
+        "{known_service_names}")
+
+
 class ApiVersionNotFoundError(BotoCoreError):
     """
     The data associated with either that API version or a compatible one
@@ -45,6 +58,22 @@ class ApiVersionNotFoundError(BotoCoreError):
     :ivar path: The API version that the user attempted to load.
     """
     fmt = 'Unable to load data {data_path} for: {api_version}'
+
+
+class EndpointConnectionError(BotoCoreError):
+    fmt = (
+        'Could not connect to the endpoint URL: "{endpoint_url}"')
+
+
+class ConnectionClosedError(ConnectionError):
+    fmt = (
+        'Connection was closed before we received a valid response '
+        'from endpoint URL: "{endpoint_url}".')
+
+    def __init__(self, **kwargs):
+        msg = self.fmt.format(**kwargs)
+        kwargs.pop('endpoint_url')
+        super(ConnectionClosedError, self).__init__(msg, **kwargs)
 
 
 class NoCredentialsError(BotoCoreError):
@@ -64,16 +93,16 @@ class PartialCredentialsError(BotoCoreError):
     fmt = 'Partial credentials found in {provider}, missing: {cred_var}'
 
 
-class NoRegionError(BotoCoreError):
+class CredentialRetrievalError(BotoCoreError):
     """
-    No region was specified
+    Error attempting to retrieve credentials from a remote source.
 
-    :ivar env_var: The name of the environment variable to use to
-        specify the default region.
+    :ivar provider: The name of the credential provider.
+    :ivar error_msg: The msg explaning why credentials could not be
+        retrieved.
+
     """
-    fmt = (
-        'You must specify a region or set the {env_var} environment variable.'
-    )
+    fmt = 'Error when retrieving credentials from {provider}: {error_msg}'
 
 
 class UnknownSignatureVersionError(BotoCoreError):
@@ -95,7 +124,22 @@ class ServiceNotInRegionError(BotoCoreError):
     fmt = 'Service {service_name} not available in region {region_name}'
 
 
-class UnknownEndpointError(BotoCoreError):
+class BaseEndpointResolverError(BotoCoreError):
+    """Base error for endpoint resolving errors.
+
+    Should never be raised directly, but clients can catch
+    this exception if they want to generically handle any errors
+    during the endpoint resolution process.
+
+    """
+
+
+class NoRegionError(BaseEndpointResolverError):
+    """No region was specified."""
+    fmt = 'You must specify a region.'
+
+
+class UnknownEndpointError(BaseEndpointResolverError, ValueError):
     """
     Could not construct an endpoint.
 
@@ -211,6 +255,20 @@ class UnknownParameterError(ValidationError):
     )
 
 
+class AliasConflictParameterError(ValidationError):
+    """
+    Error when an alias is provided for a parameter as well as the original.
+
+    :ivar original: The name of the original parameter.
+    :ivar alias: The name of the alias
+    :ivar operation: The name of the operation.
+    """
+    fmt = (
+        "Parameter '{original}' and its alias '{alias}' were provided "
+        "for operation {operation}.  Only one of them may be used."
+    )
+
+
 class UnknownServiceStyle(BotoCoreError):
     """
     Unknown style of service invocation.
@@ -226,15 +284,6 @@ class PaginationError(BotoCoreError):
 
 class OperationNotPageableError(BotoCoreError):
     fmt = 'Operation cannot be paginated: {operation_name}'
-
-
-class EventNotFound(BotoCoreError):
-    """
-    The specified event name is unknown to the system.
-
-    :ivar event_name: The name of the event the user attempted to use.
-    """
-    fmt = 'The event ({event_name}) is not known'
 
 
 class ChecksumError(BotoCoreError):
@@ -258,6 +307,10 @@ class WaiterError(BotoCoreError):
     """Waiter failed to reach desired state."""
     fmt = 'Waiter {name} failed: {reason}'
 
+    def __init__(self, name, reason, last_response):
+        super(WaiterError, self).__init__(name=name, reason=reason)
+        self.last_response = last_response
+
 
 class IncompleteReadError(BotoCoreError):
     """HTTP response did not return expected number of bytes."""
@@ -280,15 +333,107 @@ class WaiterConfigError(BotoCoreError):
     fmt = 'Error processing waiter config: {error_msg}'
 
 
+class UnknownClientMethodError(BotoCoreError):
+    """Error when trying to access a method on a client that does not exist."""
+    fmt = 'Client does not have method: {method_name}'
+
+
+class UnsupportedSignatureVersionError(BotoCoreError):
+    """Error when trying to access a method on a client that does not exist."""
+    fmt = 'Signature version is not supported: {signature_version}'
+
+
 class ClientError(Exception):
     MSG_TEMPLATE = (
         'An error occurred ({error_code}) when calling the {operation_name} '
-        'operation: {error_message}')
+        'operation{retry_info}: {error_message}')
 
     def __init__(self, error_response, operation_name):
+        retry_info = self._get_retry_info(error_response)
+        error = error_response.get('Error', {})
         msg = self.MSG_TEMPLATE.format(
-            error_code=error_response['Error']['Code'],
-            error_message=error_response['Error']['Message'],
-            operation_name=operation_name)
+            error_code=error.get('Code', 'Unknown'),
+            error_message=error.get('Message', 'Unknown'),
+            operation_name=operation_name,
+            retry_info=retry_info,
+        )
         super(ClientError, self).__init__(msg)
         self.response = error_response
+        self.operation_name = operation_name
+
+    def _get_retry_info(self, response):
+        retry_info = ''
+        if 'ResponseMetadata' in response:
+            metadata = response['ResponseMetadata']
+            if metadata.get('MaxAttemptsReached', False):
+                if 'RetryAttempts' in metadata:
+                    retry_info = (' (reached max retries: %s)' %
+                                  metadata['RetryAttempts'])
+        return retry_info
+
+
+class UnsupportedTLSVersionWarning(Warning):
+    """Warn when an openssl version that uses TLS 1.2 is required"""
+    pass
+
+
+class ImminentRemovalWarning(Warning):
+    pass
+
+
+class InvalidDNSNameError(BotoCoreError):
+    """Error when virtual host path is forced on a non-DNS compatible bucket"""
+    fmt = (
+        'Bucket named {bucket_name} is not DNS compatible. Virtual '
+        'hosted-style addressing cannot be used. The addressing style '
+        'can be configured by removing the addressing_style value '
+        'or setting that value to \'path\' or \'auto\' in the AWS Config '
+        'file or in the botocore.client.Config object.'
+    )
+
+
+class InvalidS3AddressingStyleError(BotoCoreError):
+    """Error when an invalid path style is specified"""
+    fmt = (
+        'S3 addressing style {s3_addressing_style} is invaild. Valid options '
+        'are: \'auto\', \'virtual\', and \'path\''
+    )
+
+
+class InvalidRetryConfigurationError(BotoCoreError):
+    """Error when invalid retry configuration is specified"""
+    fmt = (
+        'Cannot provide retry configuration for "{retry_config_option}". '
+        'Valid retry configuration options are: \'max_attempts\''
+    )
+
+
+class InvalidMaxRetryAttemptsError(InvalidRetryConfigurationError):
+    """Error when invalid retry configuration is specified"""
+    fmt = (
+        'Value provided to "max_attempts": {provided_max_attempts} must '
+        'be an integer greater than or equal to zero.'
+    )
+
+class StubResponseError(BotoCoreError):
+    fmt = 'Error getting response stub for operation {operation_name}: {reason}'
+
+
+class StubAssertionError(StubResponseError, AssertionError):
+    fmt = 'Error getting response stub for operation {operation_name}: {reason}'
+
+
+class InvalidConfigError(BotoCoreError):
+    fmt = '{error_msg}'
+
+
+class RefreshWithMFAUnsupportedError(BotoCoreError):
+    fmt = 'Cannot refresh credentials: MFA token required.'
+
+
+class MD5UnavailableError(BotoCoreError):
+    fmt = "This system does not support MD5 generation."
+
+
+class MetadataRetrievalError(BotoCoreError):
+    fmt = "Error retrieving metadata: {error_msg}"

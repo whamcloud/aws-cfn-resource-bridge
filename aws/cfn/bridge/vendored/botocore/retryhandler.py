@@ -17,10 +17,10 @@ import functools
 import logging
 from binascii import crc32
 
-from .vendored.requests import ConnectionError, Timeout
-from .vendored.requests.packages.urllib3.exceptions import ClosedPoolError
+from botocore.vendored.requests import ConnectionError, Timeout
+from botocore.vendored.requests.packages.urllib3.exceptions import ClosedPoolError
 
-from .exceptions import ChecksumError
+from botocore.exceptions import ChecksumError, EndpointConnectionError
 
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,10 @@ logger = logging.getLogger(__name__)
 # to get more specific exceptions from requests we can update
 # this mapping with more specific exceptions.
 EXCEPTION_MAP = {
-    'GENERAL_CONNECTION_ERROR': [ConnectionError, ClosedPoolError, Timeout],
+    'GENERAL_CONNECTION_ERROR': [
+        ConnectionError, ClosedPoolError, Timeout,
+        EndpointConnectionError
+    ],
 }
 
 
@@ -216,7 +219,8 @@ class BaseChecker(object):
         if response is not None:
             return self._check_response(attempt_number, response)
         elif caught_exception is not None:
-            return self._check_caught_exception(attempt_number, caught_exception)
+            return self._check_caught_exception(
+                attempt_number, caught_exception)
         else:
             raise ValueError("Both response and caught_exception are None.")
 
@@ -247,6 +251,9 @@ class MaxAttemptsDecorator(BaseChecker):
                                           caught_exception)
         if should_retry:
             if attempt_number >= self._max_attempts:
+                # explicitly set MaxAttemptsReached
+                if response is not None and 'ResponseMetadata' in response[1]:
+                    response[1]['ResponseMetadata']['MaxAttemptsReached'] = True
                 logger.debug("Reached the maximum number of retry "
                              "attempts: %s", attempt_number)
                 return False

@@ -189,29 +189,15 @@ class Message(object):
         return json.loads(json.loads(self._message["Body"])["Message"])
 
     def delete(self):
-        sqs = bc_session.get_session().get_service("sqs")
-        delete = sqs.get_operation("DeleteMessage")
-        http_response, response_data = delete.call(sqs.get_endpoint(self._region),
-                                                   queue_url=self._queue_url,
-                                                   receipt_handle=self._message.get("ReceiptHandle"))
-
-        # Swallow up any errors/issues, logging them out
-        if http_response.status_code != 200:
-            log.error(u"Failed to delete message from queue %s with status_code %s: %s" %
-                      (self._queue_url, http_response.status_code, response_data))
+        sqs = bc_session.get_session().create_client("sqs", region_name=self._region)
+        response_data = sqs.delete_message(QueueUrl=self._queue_url,
+                                           ReceiptHandle=self._message.get("ReceiptHandle"))
 
     def change_message_visibility(self, timeout):
-        sqs = bc_session.get_session().get_service("sqs")
-        delete = sqs.get_operation("ChangeMessageVisibility")
-        http_response, response_data = delete.call(sqs.get_endpoint(self._region),
-                                                   queue_url=self._queue_url,
-                                                   receipt_handle=self._message.get("ReceiptHandle"),
-                                                   visibility_timeout=timeout)
-
-        # Swallow up any errors/issues, logging them out
-        if http_response.status_code != 200:
-            log.error(u"Failed to change visibility of message from queue %s with status_code %s: %s" %
-                      (self._queue_url, http_response.status_code, response_data))
+        sqs = bc_session.get_session().create_client("sqs", region_name=self._region)
+        response_data = sqs.change_message_visibility(QueueUrl=self._queue_url,
+                                                      ReceiptHandle=self._message.get("ReceiptHandle"),
+                                                      VisibilityTimeout=timeout)
 
 
 class ResourceEvent():
