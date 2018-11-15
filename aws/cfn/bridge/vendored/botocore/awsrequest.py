@@ -18,15 +18,21 @@ import functools
 import socket
 import inspect
 
-import six
-from .vendored.requests import models
-from .vendored.requests.sessions import REDIRECT_STATI
-from .compat import HTTPHeaders, HTTPResponse
-from .exceptions import UnseekableStreamError
-from .vendored.requests.packages.urllib3.connection import VerifiedHTTPSConnection
-from .vendored.requests.packages.urllib3.connection import HTTPConnection
-from .vendored.requests.packages.urllib3.connectionpool import HTTPConnectionPool
-from .vendored.requests.packages.urllib3.connectionpool import HTTPSConnectionPool
+from botocore.compat import six
+from botocore.compat import HTTPHeaders, HTTPResponse, urlunsplit, urlsplit,\
+    urlparse
+from botocore.exceptions import UnseekableStreamError
+from botocore.utils import percent_encode_sequence
+from botocore.vendored.requests import models
+from botocore.vendored.requests.sessions import REDIRECT_STATI
+from botocore.vendored.requests.packages.urllib3.connection import \
+    VerifiedHTTPSConnection
+from botocore.vendored.requests.packages.urllib3.connection import \
+    HTTPConnection
+from botocore.vendored.requests.packages.urllib3.connectionpool import \
+    HTTPConnectionPool
+from botocore.vendored.requests.packages.urllib3.connectionpool import \
+    HTTPSConnectionPool
 
 
 logger = logging.getLogger(__name__)
@@ -72,6 +78,14 @@ class AWSHTTPConnection(HTTPConnection):
         # body in _send_request, as opposed to endheaders(), which is where the
         # body is sent in all versions > 2.6.
         self._response_received = False
+        self._expect_header_set = False
+
+    def close(self):
+        HTTPConnection.close(self)
+        # Reset all of our instance state we were tracking.
+        self._response_received = False
+        self._expect_header_set = False
+        self.response_class = self._original_response_cls
 
     def _tunnel(self):
         # Works around a bug in py26 which is fixed in later versions of
@@ -90,8 +104,8 @@ class AWSHTTPConnection(HTTPConnection):
         for header, value in self._tunnel_headers.iteritems():
             self.send("%s: %s\r\n" % (header, value))
         self.send("\r\n")
-        response = self.response_class(self.sock, strict = self.strict,
-                                       method = self._method)
+        response = self.response_class(self.sock, strict=self.strict,
+                                       method=self._method)
         (version, code, message) = response._read_status()
 
         if code != 200:
@@ -105,21 +119,34 @@ class AWSHTTPConnection(HTTPConnection):
             if line in (b'\r\n', b'\n', b''):
                 break
 
-    def _send_request(self, method, url, body, headers):
+    def _send_request(self, method, url, body, headers, *args, **kwargs):
         self._response_received = False
-        if headers.get('Expect', '') == '100-continue':
+        if headers.get('Expect', b'') == b'100-continue':
             self._expect_header_set = True
         else:
             self._expect_header_set = False
             self.response_class = self._original_response_cls
         rval = HTTPConnection._send_request(
-            self, method, url, body, headers)
+            self, method, url, body, headers, *args, **kwargs)
         self._expect_header_set = False
         return rval
 
-    def _send_output(self, message_body=None):
+    def _convert_to_bytes(self, mixed_buffer):
+        # Take a list of mixed str/bytes and convert it
+        # all into a single bytestring.
+        # Any six.text_types will be encoded as utf-8.
+        bytes_buffer = []
+        for chunk in mixed_buffer:
+            if isinstance(chunk, six.text_type):
+                bytes_buffer.append(chunk.encode('utf-8'))
+            else:
+                bytes_buffer.append(chunk)
+        msg = b"\r\n".join(bytes_buffer)
+        return msg
+
+    def _send_output(self, message_body=None, *args, **kwargs):
         self._buffer.extend((b"", b""))
-        msg = b"\r\n".join(self._buffer)
+        msg = self._convert_to_bytes(self._buffer)
         del self._buffer[:]
         # If msg and message_body are sent in a single send() call,
         # it will avoid performance problems caused by the interaction
@@ -154,6 +181,18 @@ class AWSHTTPConnection(HTTPConnection):
             # we must run the risk of Nagle.
             self.send(message_body)
 
+    def _consume_headers(self, fp):
+        # Most servers (including S3) will just return
+        # the CLRF after the 100 continue response.  However,
+        # some servers (I've specifically seen this for squid when
+        # used as a straight HTTP proxy) will also inject a
+        # Connection: keep-alive header.  To account for this
+        # we'll read until we read '\r\n', and ignore any headers
+        # that come immediately after the 100 continue response.
+        current = None
+        while current != b'\r\n':
+            current = fp.readline()
+
     def _handle_expect_response(self, message_body):
         # This is called when we sent the request headers containing
         # an Expect: 100-continue header and received a response.
@@ -163,9 +202,9 @@ class AWSHTTPConnection(HTTPConnection):
             maybe_status_line = fp.readline()
             parts = maybe_status_line.split(None, 2)
             if self._is_100_continue_status(maybe_status_line):
-                # Read an empty line as per the RFC.
-                fp.readline()
-                logger.debug("100 Continue response seen, now sending request body.")
+                self._consume_headers(fp)
+                logger.debug("100 Continue response seen, "
+                             "now sending request body.")
                 self._send_message_body(message_body)
             elif len(parts) == 3 and parts[0].startswith(b'HTTP/'):
                 # From the RFC:
@@ -181,7 +220,7 @@ class AWSHTTPConnection(HTTPConnection):
                 # whatever the server has sent back is the final response
                 # and don't send the message_body.
                 logger.debug("Received a non 100 Continue response "
-                            "from the server, NOT sending request body.")
+                             "from the server, NOT sending request body.")
                 status_tuple = (parts[0].decode('ascii'),
                                 int(parts[1]), parts[2].decode('ascii'))
                 response_class = functools.partial(
@@ -206,8 +245,8 @@ class AWSHTTPConnection(HTTPConnection):
         parts = maybe_status_line.split(None, 2)
         # Check for HTTP/<version> 100 Continue\r\n
         return (
-            len(parts) == 3 and parts[0].startswith(b'HTTP/') and
-            parts[1] == b'100' and parts[2].startswith(b'Continue'))
+            len(parts) >= 3 and parts[0].startswith(b'HTTP/') and
+            parts[1] == b'100')
 
 
 class AWSHTTPSConnection(VerifiedHTTPSConnection):
@@ -222,6 +261,83 @@ for name, function in AWSHTTPConnection.__dict__.items():
         setattr(AWSHTTPSConnection, name, function)
 
 
+def prepare_request_dict(request_dict, endpoint_url, context=None,
+                         user_agent=None):
+    """
+    This method prepares a request dict to be created into an
+    AWSRequestObject. This prepares the request dict by adding the
+    url and the user agent to the request dict.
+
+    :type request_dict: dict
+    :param request_dict:  The request dict (created from the
+        ``serialize`` module).
+
+    :type user_agent: string
+    :param user_agent: The user agent to use for this request.
+
+    :type endpoint_url: string
+    :param endpoint_url: The full endpoint url, which contains at least
+        the scheme, the hostname, and optionally any path components.
+    """
+    r = request_dict
+    if user_agent is not None:
+        headers = r['headers']
+        headers['User-Agent'] = user_agent
+    url = _urljoin(endpoint_url, r['url_path'])
+    if r['query_string']:
+        encoded_query_string = percent_encode_sequence(r['query_string'])
+        if '?' not in url:
+            url += '?%s' % encoded_query_string
+        else:
+            url += '&%s' % encoded_query_string
+    r['url'] = url
+    r['context'] = context
+    if context is None:
+        r['context'] = {}
+
+
+def create_request_object(request_dict):
+    """
+    This method takes a request dict and creates an AWSRequest object
+    from it.
+
+    :type request_dict: dict
+    :param request_dict:  The request dict (created from the
+        ``prepare_request_dict`` method).
+
+    :rtype: ``botocore.awsrequest.AWSRequest``
+    :return: An AWSRequest object based on the request_dict.
+
+    """
+    r = request_dict
+    request_object = AWSRequest(
+        method=r['method'], url=r['url'], data=r['body'], headers=r['headers'])
+    request_object.context.update(r['context'])
+    return request_object
+
+
+def _urljoin(endpoint_url, url_path):
+    p = urlsplit(endpoint_url)
+    # <part>   - <index>
+    # scheme   - p[0]
+    # netloc   - p[1]
+    # path     - p[2]
+    # query    - p[3]
+    # fragment - p[4]
+    if not url_path or url_path == '/':
+        # If there's no path component, ensure the URL ends with
+        # a '/' for backwards compatibility.
+        if not p[2]:
+            return endpoint_url + '/'
+        return endpoint_url
+    if p[2].endswith('/') and url_path.startswith('/'):
+        new_path = p[2][:-1] + url_path
+    else:
+        new_path = p[2] + url_path
+    reconstructed = urlunsplit((p[0], p[1], new_path, p[3], p[4]))
+    return reconstructed
+
+
 class AWSRequest(models.RequestEncodingMixin, models.Request):
     def __init__(self, *args, **kwargs):
         self.auth_path = None
@@ -234,6 +350,14 @@ class AWSRequest(models.RequestEncodingMixin, models.Request):
             for key, value in self.headers.items():
                 headers[key] = value
         self.headers = headers
+        # This is a dictionary to hold information that is used when
+        # processing the request. What is inside of ``context`` is open-ended.
+        # For example, it may have a timestamp key that is used for holding
+        # what the timestamp is when signing the request. Note that none
+        # of the information that is inside of ``context`` is directly
+        # sent over the wire; the information is only used to assist in
+        # creating what is sent over the wire.
+        self.context = {}
 
     def prepare(self):
         """Constructs a :class:`AWSPreparedRequest <AWSPreparedRequest>`."""
@@ -252,6 +376,8 @@ class AWSRequest(models.RequestEncodingMixin, models.Request):
         p = models.PreparedRequest()
         p.prepare_headers({})
         p.prepare_body(self.data, self.files)
+        if isinstance(p.body, six.text_type):
+            p.body = p.body.encode('utf-8')
         return p.body
 
 
@@ -301,6 +427,28 @@ class AWSPreparedRequest(models.PreparedRequest):
         except Exception as e:
             logger.debug("Unable to rewind stream: %s", e)
             raise UnseekableStreamError(stream_object=self.body)
+
+    def prepare_body(self, data, files, json=None):
+        """Prepares the given HTTP body data."""
+        super(AWSPreparedRequest, self).prepare_body(data, files, json)
+
+        # Calculate the Content-Length by trying to seek the file as
+        # requests cannot determine content length for some seekable file-like
+        # objects.
+        if 'Content-Length' not in self.headers:
+            if hasattr(data, 'seek') and hasattr(data, 'tell'):
+                orig_pos = data.tell()
+                data.seek(0, 2)
+                end_file_pos = data.tell()
+                self.headers['Content-Length'] = str(end_file_pos - orig_pos)
+                data.seek(orig_pos)
+                # If the Content-Length was added this way, a
+                # Transfer-Encoding was added by requests because it did
+                # not add a Content-Length header. However, the
+                # Transfer-Encoding header is not supported for
+                # AWS Services so remove it if it is added.
+                if 'Transfer-Encoding' in self.headers:
+                    self.headers.pop('Transfer-Encoding')
 
 
 HTTPSConnectionPool.ConnectionCls = AWSHTTPSConnection

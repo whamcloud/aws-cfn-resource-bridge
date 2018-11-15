@@ -13,19 +13,30 @@
 
 import copy
 import datetime
-import six
 import sys
 import inspect
+import warnings
+import hashlib
+import logging
+
+from botocore.vendored import six
+from botocore.exceptions import MD5UnavailableError
+from botocore.vendored.requests.packages.urllib3 import exceptions
+
+logger = logging.getLogger(__name__)
 
 
 if six.PY3:
-    from six.moves import http_client
+    from botocore.vendored.six.moves import http_client
+
     class HTTPHeaders(http_client.HTTPMessage):
         pass
+
     from urllib.parse import quote
     from urllib.parse import urlencode
     from urllib.parse import unquote
     from urllib.parse import unquote_plus
+    from urllib.parse import urlparse
     from urllib.parse import urlsplit
     from urllib.parse import urlunsplit
     from urllib.parse import urljoin
@@ -35,6 +46,7 @@ if six.PY3:
     from io import IOBase as _IOBase
     from base64 import encodebytes
     from email.utils import formatdate
+    from itertools import zip_longest
     file_type = _IOBase
     zip = zip
 
@@ -56,12 +68,23 @@ if six.PY3:
         # changes when using getargspec with functools.partials.
         return inspect.getfullargspec(func)[2]
 
+    def ensure_unicode(s, encoding=None, errors=None):
+        # NOOP in Python 3, because every string is already unicode
+        return s
+
+    def ensure_bytes(s, encoding='utf-8', errors='strict'):
+        if isinstance(s, str):
+            return s.encode(encoding, errors)
+        if isinstance(s, bytes):
+            return s
+        raise ValueError("Expected str or bytes, received %s." % type(s))
 
 else:
     from urllib import quote
     from urllib import urlencode
     from urllib import unquote
     from urllib import unquote_plus
+    from urlparse import urlparse
     from urlparse import urlsplit
     from urlparse import urlunsplit
     from urlparse import urljoin
@@ -71,6 +94,7 @@ else:
     from email.Utils import formatdate
     file_type = file
     from itertools import izip as zip
+    from itertools import izip_longest as zip_longest
     from httplib import HTTPResponse
     from base64 import encodestring as encodebytes
 
@@ -103,6 +127,18 @@ else:
     def accepts_kwargs(func):
         return inspect.getargspec(func)[2]
 
+    def ensure_unicode(s, encoding='utf-8', errors='strict'):
+        if isinstance(s, six.text_type):
+            return s
+        return unicode(s, encoding, errors)
+
+    def ensure_bytes(s, encoding='utf-8', errors='strict'):
+        if isinstance(s, unicode):
+            return s.encode(encoding, errors)
+        if isinstance(s, str):
+            return s
+        raise ValueError("Expected str or unicode, received %s." % type(s))
+
 try:
     from collections import OrderedDict
 except ImportError:
@@ -116,10 +152,39 @@ if sys.version_info[:2] == (2, 6):
     # will raise a plain old SyntaxError instead of
     # a real exception, so we need to abstract this change.
     XMLParseError = SyntaxError
+
+    # Handle https://github.com/shazow/urllib3/issues/497 for py2.6.  In
+    # python2.6, there is a known issue where sometimes we cannot read the SAN
+    # from an SSL cert (http://bugs.python.org/issue13034).  However, newer
+    # versions of urllib3 will warn you when there is no SAN.  While we could
+    # just turn off this warning in urllib3 altogether, we _do_ want warnings
+    # when they're legitimate warnings.  This method tries to scope the warning
+    # filter to be as specific as possible.
+    def filter_ssl_san_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message="Certificate has no.*subjectAltName.*",
+            category=exceptions.SecurityWarning,
+            module=r".*urllib3\.connection")
 else:
     import xml.etree.cElementTree
     XMLParseError = xml.etree.cElementTree.ParseError
     import json
+
+    def filter_ssl_san_warnings():
+        # Noop for non-py26 versions.  We will parse the SAN
+        # appropriately.
+        pass
+
+
+def filter_ssl_warnings():
+    # Ignore warnings related to SNI as it is not being used in validations.
+    warnings.filterwarnings(
+        'ignore',
+        message="A true SSLContext object is not available.*",
+        category=exceptions.InsecurePlatformWarning,
+        module=r".*urllib3\.util\.ssl_")
+    filter_ssl_san_warnings()
 
 
 @classmethod
@@ -179,3 +244,30 @@ def total_seconds(delta):
     day_in_seconds = delta.days * 24 * 3600.0
     micro_in_seconds = delta.microseconds / 10.0**6
     return day_in_seconds + delta.seconds + micro_in_seconds
+
+
+# Checks to see if md5 is available on this system. A given system might not
+# have access to it for various reasons, such as FIPS mode being enabled.
+try:
+    hashlib.md5()
+    MD5_AVAILABLE = True
+except ValueError:
+    MD5_AVAILABLE = False
+
+
+def get_md5(*args, **kwargs):
+    """
+    Attempts to get an md5 hashing object.
+
+    :param raise_error_if_unavailable: raise an error if md5 is unavailable on
+        this system. If False, None will be returned if it is unavailable.
+    :type raise_error_if_unavailable: bool
+    :param args: Args to pass to the MD5 constructor
+    :param kwargs: Key word arguments to pass to the MD5 constructor
+    :return: An MD5 hashing object if available. If it is unavailable, None
+        is returned if raise_error_if_unavailable is set to False.
+    """
+    if MD5_AVAILABLE:
+        return hashlib.md5(*args, **kwargs)
+    else:
+        raise MD5UnavailableError()

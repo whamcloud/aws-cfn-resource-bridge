@@ -16,7 +16,7 @@ import os
 import re
 import logging
 
-__version__ = '0.73.0'
+__version__ = '1.6.0'
 
 
 class NullHandler(logging.Handler):
@@ -31,11 +31,12 @@ log.addHandler(NullHandler())
 _first_cap_regex = re.compile('(.)([A-Z][a-z]+)')
 _number_cap_regex = re.compile('([a-z])([0-9]+)')
 _end_cap_regex = re.compile('([a-z0-9])([A-Z])')
+# The regex below handles the special case where some acryonym
+# name is pluralized, e.g GatewayARNs, ListWebACLs, SomeCNAMEs.
+_special_case_transform = re.compile('[A-Z]{3,}s$')
 # Prepopulate the cache with special cases that don't match
 # our regular transformation.
 _xform_cache = {
-    ('SwapEnvironmentCNAMEs', '_'): 'swap_environment_cnames',
-    ('SwapEnvironmentCNAMEs', '-'): 'swap-environment-cnames',
     ('CreateCachediSCSIVolume', '_'): 'create_cached_iscsi_volume',
     ('CreateCachediSCSIVolume', '-'): 'create-cached-iscsi-volume',
     ('DescribeCachediSCSIVolumes', '_'): 'describe_cached_iscsi_volumes',
@@ -44,15 +45,36 @@ _xform_cache = {
     ('DescribeStorediSCSIVolumes', '-'): 'describe-stored-iscsi-volumes',
     ('CreateStorediSCSIVolume', '_'): 'create_stored_iscsi_volume',
     ('CreateStorediSCSIVolume', '-'): 'create-stored-iscsi-volume',
-    ('NotificationARNs', '_'): 'notification_arns',
-    ('NotificationARNs', '-'): 'notification-arns',
+    ('ListHITsForQualificationType', '_'): 'list_hits_for_qualification_type',
+    ('ListHITsForQualificationType', '-'): 'list-hits-for-qualification-type',
+}
+# The items in this dict represent partial renames to apply globally to all
+# services which might have a matching argument or operation. This way a
+# common mis-translation can be fixed without having to call out each
+# individual case.
+_partial_renames = {
+    'ipv-6': 'ipv6',
+    'ipv_6': 'ipv6',
 }
 ScalarTypes = ('string', 'integer', 'boolean', 'timestamp', 'float', 'double')
 
 BOTOCORE_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
-def xform_name(name, sep='_', _xform_cache=_xform_cache):
+# Used to specify anonymous (unsigned) request signature
+class UNSIGNED(object):
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memodict):
+        return self
+
+
+UNSIGNED = UNSIGNED()
+
+
+def xform_name(name, sep='_', _xform_cache=_xform_cache,
+               partial_renames=_partial_renames):
     """Convert camel case to a "pythonic" name.
 
     If the name contains the ``sep`` character, then it is
@@ -65,27 +87,18 @@ def xform_name(name, sep='_', _xform_cache=_xform_cache):
         return name
     key = (name, sep)
     if key not in _xform_cache:
+        if _special_case_transform.search(name) is not None:
+            is_special = _special_case_transform.search(name)
+            matched = is_special.group()
+            # Replace something like ARNs, ACLs with _arns, _acls.
+            name = name[:-len(matched)] + sep + matched.lower()
         s1 = _first_cap_regex.sub(r'\1' + sep + r'\2', name)
         s2 = _number_cap_regex.sub(r'\1' + sep + r'\2', s1)
         transformed = _end_cap_regex.sub(r'\1' + sep + r'\2', s2).lower()
+
+        # Do partial renames
+        for old, new in partial_renames.items():
+            if old in transformed:
+                transformed = transformed.replace(old, new)
         _xform_cache[key] = transformed
     return _xform_cache[key]
-
-
-class BotoCoreObject(object):
-
-    def __init__(self, **kwargs):
-        self.name = ''
-        self.py_name = None
-        self.cli_name = None
-        self.type = None
-        self.members = []
-        self.documentation = ''
-        self.__dict__.update(kwargs)
-        if self.py_name is None:
-            self.py_name = xform_name(self.name, '_')
-        if self.cli_name is None:
-            self.cli_name = xform_name(self.name, '-')
-
-    def __repr__(self):
-        return '%s:%s' % (self.type, self.name)

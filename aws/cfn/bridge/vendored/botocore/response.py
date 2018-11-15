@@ -16,11 +16,11 @@ import sys
 import xml.etree.cElementTree
 import logging
 
-from . import ScalarTypes
-from .hooks import first_non_none_response
-from .compat import json, set_socket_timeout, XMLParseError
-from .exceptions import IncompleteReadError
-from . import parsers
+from botocore import ScalarTypes
+from botocore.hooks import first_non_none_response
+from botocore.compat import json, set_socket_timeout, XMLParseError
+from botocore.exceptions import IncompleteReadError
+from botocore import parsers
 
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,10 @@ class StreamingBody(object):
             raise
 
     def read(self, amt=None):
+        """Read at most amt bytes from the stream.
+
+        If the amt argument is omitted, read all data.
+        """
         chunk = self._raw_stream.read(amt)
         self._amount_read += len(chunk)
         if not chunk or amt is None:
@@ -77,22 +81,18 @@ class StreamingBody(object):
         return chunk
 
     def _verify_content_length(self):
+        # See: https://github.com/kennethreitz/requests/issues/1855
+        # Basically, our http library doesn't do this for us, so we have
+        # to do this ourself.
         if self._content_length is not None and \
                 self._amount_read != int(self._content_length):
             raise IncompleteReadError(
                 actual_bytes=self._amount_read,
                 expected_bytes=int(self._content_length))
 
-
-def _validate_content_length(expected_content_length, body_length):
-    # See: https://github.com/kennethreitz/requests/issues/1855
-    # Basically, our http library doesn't do this for us, so we have
-    # to do this ourself.
-    if expected_content_length is not None:
-        if int(expected_content_length) != body_length:
-            raise IncompleteReadError(
-                actual_bytes=body_length,
-                expected_bytes=int(expected_content_length))
+    def close(self):
+        """Close the underlying http response stream."""
+        self._raw_stream.close()
 
 
 def get_response(operation_model, http_response):
